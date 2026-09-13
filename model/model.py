@@ -70,3 +70,26 @@ class MyMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+
+import torch
+import torch.nn as nn
+
+# 继承nn.Module类，定义模型的结构和前向传播逻辑
+class RMSNorm(nn.Module):
+# __init__初始化
+    def __init__(self, dim : int, eps: float = 1e-5):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+# _norm
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        # 计算均方根
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+# forward
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 归一化
+        output = self._norm(x.float())
+        # 缩放
+        output = output * self.weight
+        return output.type_as(x)
