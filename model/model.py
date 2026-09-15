@@ -93,3 +93,8 @@ class RMSNorm(nn.Module):
         # 缩放
         output = output * self.weight
         return output.type_as(x)
+
+
+
+
+    
