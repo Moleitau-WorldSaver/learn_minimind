@@ -1,0 +1,46 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+env/
+
+# 工具缓存
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# ─────────────────────────────────────────────
+# ★★★ 密钥 / 本地配置 —— 千万别提交！ ★★★
+# ─────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.json
+
+# 训练产物（模型权重、checkpoint 动辄几个 GB）
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+out/
+outputs/
+checkpoints/
+wandb/
+logs/
