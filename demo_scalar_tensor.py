@@ -1,0 +1,78 @@
+import io
+import sys
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+import math
+import torch
+
+print("=" * 70)
+print("先澄清: '二分之一' 是个数(0.5), 张量是装它的容器")
+print("=" * 70)
+x = 1 / 2
+print(f"  Python 里 1/2        = {x}   类型 {type(x).__name__}")
+t = torch.tensor(1 / 2)
+print(f"  torch.tensor(1/2)    = {t}   类型 {type(t).__name__}")
+
+print("\n" + "=" * 70)
+print("它是'标量张量': shape=() 的 0 维张量")
+print("=" * 70)
+print(f"  t          = {t}")
+print(f"  t.shape    = {tuple(t.shape)}   <- 空的! 没有维度")
+print(f"  t.dim()    = {t.dim()}          <- 0 维")
+print(f"  t.numel()  = {t.numel()}        <- 1 个元素")
+print(f"  t.dtype    = {t.dtype}")
+print("  类比: 一个盒子, 里面只装了一个数")
+
+print("\n" + "=" * 70)
+print("和 '一维张量' 的区别(形状上有 1 个元素, 但维度不同)")
+print("=" * 70)
+s = torch.tensor([1 / 2])
+print(f"  torch.tensor(0.5)   -> shape {str(tuple(t.shape)):<8} dim {t.dim()}   值 {t}")
+print(f"  torch.tensor([0.5]) -> shape {str(tuple(s.shape)):<8} dim {s.dim()}   值 {s}")
+print("  数值一样, 形状不同: () vs (1,)")
+print(f"  t == s ? {bool(t == s)}   (数值比较相等, 但形状不同)")
+
+print("\n" + "=" * 70)
+print("cos(60度) 的结果就是一个'标量张量'")
+print("=" * 70)
+r = torch.cos(torch.tensor(60 * math.pi / 180))
+print(f"  torch.cos(torch.tensor(1.047198)) = {r}")
+print(f"  repr 显示 tensor(0.5000), 内部存的是 {r.item()}")
+print(f"  它不是'二分之一这个张量', 而是'值为 1/2 的张量'")
+
+print("\n" + "=" * 70)
+print("什么时候需要 .item()")
+print("=" * 70)
+print(f"  r * 2        = {r * 2}        <- 张量运算, 还是张量")
+print(f"  r + r        = {r + r}        <- 还是张量")
+print(f"  r.item()     = {r.item()}     <- 变回 Python float")
+print(f"  float(r)     = {float(r)}")
+print(f"  type(r.item()) = {type(r.item()).__name__}")
+print()
+print("  需要 .item() 的场景:")
+print("    - f-string 格式化: f'{r:.2f}' 可以, 但 f'{r:.2f}' 对 0维张量也行")
+print(f"      实测: f'{{r:.4f}}' = {f'{r:.4f}'}")
+print("    - 存进 Python list / dict 做普通数值处理")
+print("    - 日志打印想要干净的数字而不是 tensor(...)")
+
+print("\n" + "=" * 70)
+print("'张量的一半' 也可以指: 张量整体乘 0.5, 或切成两半")
+print("=" * 70)
+v = torch.tensor([2.0, 4.0, 6.0, 8.0])
+print(f"  v = {v}")
+print(f"  v * 0.5           = {v * 0.5}          <- 每个元素都变成一半")
+print(f"  v / 2             = {v / 2}            <- 等价")
+print(f"  v[:2]             = {v[:2]}            <- 切出前一半(1/2 的切片)")
+print(f"  v[v.shape[0]//2:] = {v[v.shape[0]//2:]}  <- 切出后一半")
+print("  -> 如果'二分之一'指这个, 那是'乘 0.5'或'切一半', 语境不同")
+
+print("\n" + "=" * 70)
+print("回到 RoPE: freqs_cos 的每个元素就是普通的数")
+print("=" * 70)
+dim, rope_base = 64, 1e6
+inv_freq = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
+angles = torch.outer(torch.arange(2), inv_freq)
+c = torch.cos(angles)
+print(f"  angles[1][:4] = {[round(v,4) for v in angles[1][:4].tolist()]}")
+print(f"  cos 结果      = {[round(v,4) for v in c[1][:4].tolist()]}")
+print(f"  每个都是 [-1,1] 区间里的普通实数, freqs_cos 就是这些数排成的矩阵")
