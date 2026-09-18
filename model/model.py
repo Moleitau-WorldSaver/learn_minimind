@@ -1,80 +1,44 @@
-import math
-
+import math, torch, torch.nn.functional as F
+import torch.nn as nn
 from transformers import Optional, PretrainedConfig
 
 
-class MyMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
-
-    def __init__(
-        self,
-        dropout: float = 0.0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        hidden_act: str = "silu",
-        hidden_size: int = 512,
-        intermediate_size: int | None = None,
-        max_position_embeddings: int = 32768,
-        num_attention_heads: int = 8,
-        num_hidden_layers: int = 8,
-        num_key_value_heads: int = 2,
-        vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
-        rope_theta: int = 1000000,
-        inference_rope_scaling: bool = False,
-        flash_attention: bool = True,
-        ############ MoE ############
-        use_moe: bool = False,
-        num_experts_per_tok: int = 2,
-        n_routed_experts: int = 4,
-        n_shared_experts: int = 1,
-        scoring_func: str = "softmax",
-        aux_loss_alpha: float = 0.01,
-        seq_aux: bool = True,
-        norm_topk_prob: bool = True,
-        **kwargs,
-    ):
+class MiniMindConfig(PretrainedConfig):
+    model_type = "minimind"
+    def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
         super().__init__(**kwargs)
-
-        self.dropout = dropout
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.hidden_act = hidden_act
         self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.max_position_embeddings = max_position_embeddings
-        self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
-        self.num_key_value_heads = num_key_value_heads
-        self.vocab_size = vocab_size
-        self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
-        self.inference_rope_scaling = inference_rope_scaling
-        self.flash_attention = flash_attention
         self.use_moe = use_moe
-        self.num_experts_per_tok = num_experts_per_tok
-        self.n_routed_experts = n_routed_experts
-        self.n_shared_experts = n_shared_experts
-        self.seq_aux = seq_aux
-        self.norm_topk_prob = norm_topk_prob
-        self.aux_loss_alpha = aux_loss_alpha
-        self.scoring_func = scoring_func
-
-        self.rope_scaling = (
-            {
-                "beta_fast": 32,
-                "beta_slow": 1,
-                "factor": 16,
-                "original_max_position_embeddings": 2048,
-                "attention_factor": 1.0,
-                "type": "yarn",
-            }
-            if self.inference_rope_scaling
-            else None
-        )
-
-import torch
-import torch.nn as nn
+        self.dropout = kwargs.get("dropout", 0.0)
+        self.vocab_size = kwargs.get("vocab_size", 6400)
+        self.bos_token_id = kwargs.get("bos_token_id", 1)
+        self.eos_token_id = kwargs.get("eos_token_id", 2)
+        self.flash_attn = kwargs.get("flash_attn", True)
+        self.num_attention_heads = kwargs.get("num_attention_heads", 8)
+        self.num_key_value_heads = kwargs.get("num_key_value_heads", 4)
+        self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_attention_heads)
+        self.hidden_act = kwargs.get("hidden_act", 'silu')
+        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
+        self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
+        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        self.rope_theta = kwargs.get("rope_theta", 1e6)
+        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
+        self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
+        self.rope_scaling = {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 16,
+            "original_max_position_embeddings": 2048,
+            "attention_factor": 1.0,
+            "type": "yarn"
+        } if self.inference_rope_scaling else None
+        ### MoE specific configs (ignored if use_moe = False)
+        self.num_experts = kwargs.get("num_experts", 4)
+        self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)
+        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
+        self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
 
 # 继承nn.Module类，定义模型的结构和前向传播逻辑
 class RMSNorm(nn.Module):
@@ -114,8 +78,8 @@ def precompute_freqs(
         original_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048),
             rope_scaling.get("factor", 16),
-            rope_scaling.get("beta_fast", 32),
-            rope_scaling.get("beta_slow", 1),
+            rope_scaling.get("beta_fast", 32.0),
+            rope_scaling.get("beta_slow", 1.0),
             rope_scaling.get("attention_factor", 1.0),
         )
 
@@ -161,13 +125,141 @@ def precompute_freqs(
         #返回结果 
         return freqs_cos, freqs_sin
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids = None, unsqueeze_dim = 1):
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim = 1):
     def rotate_half(x):
         return torch.cat(
             (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
         )
-    #到这里, 注意 minimind是前半部分是x, 后半部分是y
-    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
-    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+    #到这里, 注意 minimind的旋转位置编码是是前半部分全是x, 后半部分全是y
+    q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
+    k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
+
+def repeat_kv(x:torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    # 高效的重复实现：
+    # 1. x[:, :, :, None, :]: 在第4维插入新维度 -> [bs, slen, num_kv_heads, 1, head_dim]
+    # 2. .expand(...): 扩展第4维到n_rep -> [bs, slen, num_kv_heads, n_rep, head_dim]
+    # 3. .reshape(...): 合并第3、4维 -> [bs, slen, num_kv_heads * n_rep, head_dim]
+    return (
+        x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+class Attention(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
+        # 处理GQA
+        # 如果num_key_value_heads为None, 则使用num_attention_heads, 也就是query 头的个数
+        self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
+
+        # 确保能Q头能整除K/V头, 否则报错
+        assert config.num_attention_heads % self.num_key_value_heads == 0
+
+        #注意力头配置
+        self.n_local_heads = config.num_attention_heads # Q头数
+        self.n_local_kv_heads = self.num_key_value_heads # kv头数
+        self.n_rep = config.num_attention_heads // self.num_key_value_heads # 复制份数
+        self.head_dim = config.head_dim # 每个头维度
+
+        #使用因果掩码
+        self.is_causal = True
+        # 定义线性投影层 (无偏置，节省参数)
+        # nn.Linear(in_features, out_features, bias=False)
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+
+        #对每个头的q 和 k 向量做RMSNorm归一化
+        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+        self.attn_dropout = nn.Dropout(config.dropout) #注意力权重
+        self.resid_dropout = nn.Dropout(config.dropout) #残差连接
+        self.dropout = config.dropout #保存dropout参数
+
+        #检查是否支持flash attention, 问有没有torch.nn.functional 这个函数, 如果有, 并且配置中flash_attn为True, 则启用flash attention
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+
+    def forword(
+            self,
+            x: torch.Tensor,
+            position_embeddings: tuple[torch.Tensor, torch.Tensor],
+            past_key_value: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+            use_cache = False,
+            attention_mask: Optional[torch.Tensor] = None):
+        # x: [batch_size, seq_len, hidden]
+        #[批大小(一次并行处理多少序列), 序列长度, 隐藏维]
+        bsz, seq_len, _ = x.shape
+
+        #初始化
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        #投影Q, K, V  
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        # position_embeddings是预计算的(cos, sin)，按序列位置切片并应用RoPE
+        cos, sin = position_embeddings
+
+        # 对 q/k 施加旋转位置编码：各自按【绝对位置】旋转，
+        # 效果是 q·k 只依赖两个 token 的【位置差】
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        #-------------- kv_cache处理 -----------------
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        # 如果后续需要缓存,返回更新后的新KV cache
+        # 通常是推理时use_cache = 1, 训练时等于 0 
+        past_kv = (xk,xv) if use_cache else None
+
+        # ------------- GQA: 对KV重复以匹配Q头 ----------
+        # transpose到形状 [bsz, n_heads, seq_len, head_dim] 以便矩阵乘法
+        xq = xq.transpose(1, 2)
+
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)
+        xv = repeat_kv(xv, self.n_rep) .transpose(1, 2)
+
+        # -------------------- Attention计算 --------------------
+        # 优先使用PyTorch 2.0+的scaled_dot_product_attention（Flash Attention实现）
+        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and(attention_mask is None or torch.all(attention_mask == 1)) :
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                dropout_p = self.dropout if self.training else 0.0,
+                is_causal = self.is_causal
+            )
+        else:
+            # 标准实现：scores = Q @ K^T / sqrt(d)
+            # 点积会随着维度膨胀, 除以根号下head_dim正好能把标准差压回1
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            #三角掩码
+            if self.is_causal: 
+                #先二维置为 -inf, 然后掩住上三角
+                scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
+
+            # 如果有attention_mask(0/1)，将其扩展后转为 -1e9 的加性mask（掩掉pad位置）
+            # padding 掩码, padding 是"无效位置"这些位置没有真实语义,但模型仍会给它们 embedding 并参与计算
+            # 所以需要 attention_mask 把它们的注意力权重压成 0
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+            #sortmax得到注意力权重
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+
+        # 恢复形状并做输出投影 + 标记残差流支路
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)  # [bsz, seq_len, hidden]
+        output = self.resid_dropout(self.o_proj(output)) # type: ignore
+        return output, past_kv
+            
+
+            
+
+
 
