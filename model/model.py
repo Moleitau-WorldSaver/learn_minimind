@@ -1,7 +1,9 @@
 import math, torch, torch.nn.functional as F
-import torch.nn as nn
-from transformers import Optional, PretrainedConfig
-
+from typing import Any
+from torch import nn
+from transformers.activations import ACT2FN
+from transformers import Optional, PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -183,7 +185,7 @@ class Attention(nn.Module):
         #检查是否支持flash attention, 问有没有torch.nn.functional 这个函数, 如果有, 并且配置中flash_attn为True, 则启用flash attention
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
-    def forword(
+    def forward(
             self,
             x: torch.Tensor,
             position_embeddings: tuple[torch.Tensor, torch.Tensor],
@@ -258,8 +260,52 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output)) # type: ignore
         return output, past_kv
             
+class FeedForward(nn.Module):
+    def __init__(self, config:MiniMindConfig, intermediate_size: int = 0):
+        super().__init__()
+        intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias = False)
+        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias = False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias = False)
+        # ACT2FN是transformers里激活函数的映射表，支持'silu','gelu'等
+        self.act_fn = ACT2FN[config.hidden_act]
 
-            
+    def forword(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+class MOEFeedForward(nn.Module):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+
+class MinimindBlock(nn.Module):
+
+    def __init__(self, layer_id: int, config: MiniMindConfig):
+        super().__init__()
+        self.self_attn = Attention(config)
+        self.input_layerNorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache = False, attention_mask = None):
+        #保存初始状态
+        residual = hidden_states
+        #流程顺序: LayerNorm -> Attention -> 残差相加 -> LayerNorm -> FFN -> 残差相加
+        #先从Attention, 返回hidden_states和present_key_value（用于cache）
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layerNorm(hidden_states),  # pre-norm
+            position_embeddings,
+            past_key_value,
+            use_cache,
+            attention_mask
+        )
+        # 加上 初始状态完成残差
+        hidden_states = hidden_states + residual
+        #每次进入一个层都进行 pre-norm
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+
+        return hidden_states, present_key_value
+
+
 
 
 
