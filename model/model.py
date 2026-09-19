@@ -1,9 +1,9 @@
 import math, torch, torch.nn.functional as F
-from typing import Any
+from typing import Any, List, Optional, Tuple, cast
 from torch import nn
 from transformers.activations import ACT2FN
-from transformers import Optional, PreTrainedModel, GenerationMixin, PretrainedConfig
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+from transformers import  PreTrainedModel, GenerationMixin, PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast, MoeCausalLMOutputWithPast
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -62,7 +62,7 @@ class RMSNorm(nn.Module):
         output = output * self.weight
         return output.type_as(x)
 
-def precompute_freqs(
+def precompute_freqs_cis(
         dim: int,
         end: int = int(32 * 1024),
         rope_base: float = 1e6,
@@ -111,21 +111,21 @@ def precompute_freqs(
             #freqs混合, 执行分32组快满指针
             freqs = freqs * (1 - ramp + ramp / factor)
 
-        # 7. 根据目标长度 end，生成位置索引向量 t
-        t = torch.arange(end, device=freqs.device)
+    # 7. 根据目标长度 end，生成位置索引向量 t
+    t = torch.arange(end, device=freqs.device)
 
-        # 8. 计算外积：将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
-        #"每 token 转多少弧度" × "第几个 token" = "一共转了多少弧度"
-        freqs = torch.outer(t, freqs).float()
+    # 8. 计算外积：将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
+    #"每 token 转多少弧度" × "第几个 token" = "一共转了多少弧度"
+    freqs = torch.outer(t, freqs).float()
 
-        # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
-        #张量就是存其对应的 cos 和 sin 值, 维度为 [end, dim // 2],之后cat变成 [end, dim]
-        freqs_cos, freqs_sin = (
+    # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
+    #张量就是存其对应的 cos 和 sin 值, 维度为 [end, dim // 2],之后cat变成 [end, dim]
+    freqs_cos, freqs_sin = (
             torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor,
             torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor,
         )
-        #返回结果 
-        return freqs_cos, freqs_sin
+    #返回结果 
+    return freqs_cos, freqs_sin
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim = 1):
     def rotate_half(x):
@@ -173,6 +173,7 @@ class Attention(nn.Module):
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * config.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
 
         #对每个头的q 和 k 向量做RMSNorm归一化
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -187,11 +188,11 @@ class Attention(nn.Module):
 
     def forward(
             self,
-            x: torch.Tensor,
-            position_embeddings: tuple[torch.Tensor, torch.Tensor],
-            past_key_value: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+            x,
+            position_embeddings,
+            past_key_value = None,
             use_cache = False,
-            attention_mask: Optional[torch.Tensor] = None):
+            attention_mask = None):
         # x: [batch_size, seq_len, hidden]
         #[批大小(一次并行处理多少序列), 序列长度, 隐藏维]
         bsz, seq_len, _ = x.shape
@@ -257,7 +258,7 @@ class Attention(nn.Module):
 
         # 恢复形状并做输出投影 + 标记残差流支路
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)  # [bsz, seq_len, hidden]
-        output = self.resid_dropout(self.o_proj(output)) # type: ignore
+        output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
             
 class FeedForward(nn.Module):
@@ -270,14 +271,14 @@ class FeedForward(nn.Module):
         # ACT2FN是transformers里激活函数的映射表，支持'silu','gelu'等
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forword(self, x):
+    def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 class MOEFeedForward(nn.Module):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
-class MinimindBlock(nn.Module):
+class MiniMindBlock(nn.Module):
 
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
@@ -305,7 +306,127 @@ class MinimindBlock(nn.Module):
 
         return hidden_states, present_key_value
 
+class MiniMindModel(nn.Module):
+    def __init__(self, config:MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        #映射 token_id -> 向量
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        freqs_cos, freqs_sin = precompute_freqs_cis(
+            dim = config.head_dim,
+            end = config.max_position_embeddings,
+            rope_base = config.rope_theta, 
+            rope_scaling = config.rope_scaling
+        )
+        #把 cos/sin 表登记为模型的"状态",但不存进文件
+        #每次打开重新加载, 重算成本远低于从文件读
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
+    def forward(
+            self,
+            input_ids,
+            attention_mask = None,
+            past_key_values = None,
+            use_cache = False,
+            **kwargs
+    ):
+        #input_ids : [bsz, seq_len]
+        batch_size, seq_length = input_ids.shape
+        #检查：某些框架会传入包含.layers属性的对象，视为不携带past信息
+        if hasattr(past_key_values, 'layers'): past_key_values = None
+        # past_key_values为每层的(past_k, past_v)列表，如果为None则创建与层数相同的None列表
+        past_key_values = past_key_values or [None] * len(self.layers)
+
+        # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        # past_key_values[0] 形如 (k, v)，k.shape = [bsz, past_seq_len, n_kv_heads, head_dim]
+        first_layer_past = past_key_values[0]
+        start_pos = first_layer_past[0].shape[1] if first_layer_past is not None else 0
+        # Embedding + dropout
+        hidden_states = self.dropout(self.embed_tokens(input_ids))  # [bsz, seq_len, hidden]
+
+        # 检查buff中的是否需要重算
+        if self.freqs_cos[0, 0] == 0:
+            freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
+            self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
+        # 取出对应位置范围的cos/sin作为position_embeddings
+        # self.freqs_cos/freqs_sin的shape为 [max_pos, head_dim]
+        position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
+
+        # 逐层前向，通过zip把layer和对应的past_key_value配对
+        presents = []
+        for layer, past_key_value in zip(self.layers, past_key_values):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present)
+        # 最后做归一化
+        hidden_states = self.norm(hidden_states)
+        # 如果使用MoE，收集每层的aux_loss并求和返回以便训练使用
+        # MOEFeedForward 还没有显式声明 aux_loss，属性访问会被推断成 Tensor | Module，
+        # 这里改用显式循环 + cast 标注类型，避免 sum 的类型报错
+        aux_loss = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
+        for layer in self.layers:
+            if isinstance(layer.mlp, MOEFeedForward):
+                aux_loss = aux_loss + cast(torch.Tensor, layer.mlp.aux_loss)
+        return hidden_states, presents, aux_loss
+
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+
+    def __init__(self, config: MiniMindConfig | None = None):
+        config = config or MiniMindConfig()
+        self.config = config
+        super().__init__(config)
+        self.model = MiniMindModel(self.config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
+        self.post_init()
+
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
+        #主干处理最终结果, 每层的kvcache, MoE 的负载均衡损失
+        hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
+
+        # 判断logits_to_keep是不是int型的, 如果是,新建一个slice型, 从后往前切logits_to_keep份
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+
+        # [vocab_size, hidden_size]的lm_head是个权重
+        # hidden_states进入得到原始打分, 张量类型, 经过logits输出shape不变
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+
+        #当打开训练模式的时候
+        if labels is not None:
+            # logits丢掉最后一位
+            shift_logits = logits[..., :-1, :].contiguous()
+            # labels 丢掉第一位, 预测丢掉最后一位、答案丢掉第一位,使得"位置 t 的预测"配上"位置 t+1 的答案"
+            shift_labels = labels[..., 1:].contiguous()
+            #函数内部, softmax → 取正确类的概率 → -log → 平均。
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+
+            output = CausalLMOutputWithPast(
+            loss=cast(torch.FloatTensor, loss),
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
+
+        output.aux_loss = aux_loss
+        return output
 
 
 
