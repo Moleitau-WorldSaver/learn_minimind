@@ -2,18 +2,16 @@
 
 从零手写一个小型语言模型（MiniMind 风格），用于学习 LLM 的内部结构。
 
-> ⚠️ 项目正在开发中：目前实现了模型配置与 RMSNorm，其余部分逐步补齐。
-
 ## 当前进度
 
-- [x] 模型配置 `MyMindConfig`（Llama 风格超参 + 可选 MoE）
+- [x] 模型配置 `MiniMindConfig`（Llama 风格超参）
 - [x] `RMSNorm` 归一化层
 - [x] 旋转位置编码（RoPE）
 - [x] 注意力层（GQA）
-- [x] 前馈网络（FFN / MoE）
+- [x] 前馈网络（FFN）
 - [x] 完整模型组装
-- [ ] 数据集与预训练脚本
-- [ ] 推理与对话脚本
+- [x] 数据集与预训练脚本
+- [ ] MoE / 微调 / 推理对话脚本
 
 ## 环境要求
 
@@ -26,27 +24,32 @@
 uv sync
 ```
 
-或者用 pip：
-
-```bash
-pip install -e .
-```
-
 ## 项目结构
 
 ```
 learn_minimind/
 ├── model/
-│   └── model.py            # 模型定义（MyMindConfig / RMSNorm / ...）
+│   └── model.py            # 模型定义（MiniMindConfig / RMSNorm / Attention / ...）
+├── dataset/
+│   └── im_dataset.py       # 预训练数据集封装
 ├── trainer/
 │   ├── train_pretrain.py   # 预训练入口
-│   └── trainer_utils.py    # 训练工具
-├── dataset/
-│   └── im_dataset.py       # 数据集封装
-├── src/learn_minimind/
-│   └── __init__.py
+│   └── trainer_utils.py    # 训练工具（学习率、日志、检查点、DDP）
+├── out/                    # 训练产出的权重
+├── checkpoints/            # 续训用的完整训练状态
 └── pyproject.toml
 ```
+
+## 训练
+
+在项目根目录执行：
+
+```bash
+python trainer/train_pretrain.py
+```
+
+数据放在 `dataset/pretrain_hq.jsonl`，每行一个 `{"text": "..."}`。
+续训加 `--from_resume 1`，基于已有权重继续训练加 `--from_weight pretrain`。
 
 ## 许可证
 

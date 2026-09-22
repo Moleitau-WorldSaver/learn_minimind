@@ -1,9 +1,9 @@
 import math, torch, torch.nn.functional as F
-from typing import Any, List, Optional, Tuple, cast
+from typing import Optional, cast
 from torch import nn
 from transformers.activations import ACT2FN
 from transformers import  PreTrainedModel, GenerationMixin, PretrainedConfig
-from transformers.modeling_outputs import CausalLMOutputWithPast, MoeCausalLMOutputWithPast
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
@@ -85,8 +85,8 @@ def precompute_freqs_cis(
             rope_scaling.get("attention_factor", 1.0),
         )
 
-        #只有推断长度大于原始长度, 才应用缩放
-        scale = end > original_max
+        # 只有推断长度大于原始长度, 才应用缩放
+        scale = end / original_max
         if scale > 1.0:
             # 3. 使用前文推导的公式，输入参数 β 算出到维度索引 i 的映射函数
             inv_dim = lambda b: (
@@ -274,10 +274,6 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
-class MOEFeedForward(nn.Module):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-
 class MiniMindBlock(nn.Module):
 
     def __init__(self, layer_id: int, config: MiniMindConfig):
@@ -285,7 +281,7 @@ class MiniMindBlock(nn.Module):
         self.self_attn = Attention(config)
         self.input_layerNorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        self.mlp = FeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache = False, attention_mask = None):
         #保存初始状态
@@ -370,13 +366,8 @@ class MiniMindModel(nn.Module):
             presents.append(present)
         # 最后做归一化
         hidden_states = self.norm(hidden_states)
-        # 如果使用MoE，收集每层的aux_loss并求和返回以便训练使用
-        # MOEFeedForward 还没有显式声明 aux_loss，属性访问会被推断成 Tensor | Module，
-        # 这里改用显式循环 + cast 标注类型，避免 sum 的类型报错
-        aux_loss = torch.zeros((), device=hidden_states.device, dtype=hidden_states.dtype)
-        for layer in self.layers:
-            if isinstance(layer.mlp, MOEFeedForward):
-                aux_loss = aux_loss + cast(torch.Tensor, layer.mlp.aux_loss)
+        # 稠密模型没有 MoE 的负载均衡损失，返回 0 占位，让训练脚本的 res.loss + res.aux_loss 统一可跑
+        aux_loss = hidden_states.new_zeros(1).squeeze()
         return hidden_states, presents, aux_loss
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
@@ -418,7 +409,8 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 ignore_index=-100,
             )
 
-            output = CausalLMOutputWithPast(
+        # 训练和推理都要返回输出（labels 为 None 时 loss 就是 None）
+        output = CausalLMOutputWithPast(
             loss=cast(torch.FloatTensor, loss),
             logits=logits,
             past_key_values=past_key_values,

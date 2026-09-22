@@ -3,7 +3,6 @@ __pycache__/
 *.py[oc]
 build/
 dist/
-wheels/
 *.egg-info
 
 # Virtual environments
@@ -12,21 +11,18 @@ venv/
 env/
 
 # 工具缓存
-.ruff_cache/
 .pytest_cache/
 .mypy_cache/
+.cache/
 
 # 编辑器
-.vscode/
 .idea/
 
 # 操作系统
 .DS_Store
 Thumbs.db
 
-# ─────────────────────────────────────────────
-# ★★★ 密钥 / 本地配置 —— 千万别提交！ ★★★
-# ─────────────────────────────────────────────
+# 密钥 / 本地配置
 .env
 .env.*
 !.env.example
@@ -40,7 +36,26 @@ secrets.json
 *.ckpt
 *.safetensors
 out/
-outputs/
 checkpoints/
-wandb/
 logs/
+wandb/
+
+# 数据集语料与本地训练出来的分词器（体积大 / 可重新生成）
+dataset/*.jsonl
+model/tokenizer.json
+model/tokenizer_config.json
+model/special_tokens_map.json
+
+# 打包语料（trainer/pack_corpus.py 产出，1G 语料打包后约 1.5GB）
+# 纯派生数据，可用同一条命令重新生成，不进仓库
+dataset/packed/
+
+# 教学材料（本仓库的课程/术语表/学习记录，只在本地学习用，不进仓库）
+# 用前导 / 锚定在仓库根目录，避免误伤未来可能出现的 web/assets/ 之类同名字目录
+/MISSION.md
+/NOTES.md
+/RESOURCES.md
+/assets/
+/lessons/
+/reference/
+/learning-records/
