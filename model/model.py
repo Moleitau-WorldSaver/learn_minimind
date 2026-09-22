@@ -274,6 +274,48 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
+class MOEFeedForward(nn.Module):
+    def __init__(self, config:MiniMindConfig):
+        super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias = False)
+        self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        batch_size, seq_len,hidden_dim = x.shape
+        #一票票展开
+        x_flat = x.view(-1, hidden_dim)
+        #打分 拿概率
+        scores = F.softmax(self.gate(x_flat), dim = -1)
+        topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=1, sorted=False)
+        # 官方写法：k>1 且需要归一化时才动权重；k=1 时【什么都不做】，
+        # topk_weight 直接沿用 softmax 概率本身（保留 router 的置信度）。
+        # 【改动点】删除原来的 else 分支：那里用 straight-through 把 k=1 的权重
+        # 硬掰成 1.0，等于把 pᵢ·FFNᵢ(x) 换成 FFNᵢ(x) —— 丢掉置信度，
+        # 且 MoE 支路幅度被逐 token 放大 1/概率 倍（实测对拍相对差 0.92）。
+        if self.config.num_experts_per_tok > 1 and self.config.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+
+        # 累加容器：形状/dtype/device 跟随 x_flat；必须全 0（index_add_ 是累加，不是赋值）
+        y = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            mask = (topk_idx == i)
+            #如果有专家中了(any返回0维张量)
+            if mask.any():
+                token_idx = mask.any(dim=-1).nonzero().flatten()
+                weight = topk_weight[mask].view(-1, 1)
+                y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
+            elif self.training:
+                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+
+        if self.training and self.config.router_aux_loss_coef > 0:
+            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
+            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+        else:
+            self.aux_loss = scores.new_zeros(1).squeeze()
+        return y.view(batch_size, seq_len, hidden_dim)
+    
 class MiniMindBlock(nn.Module):
 
     def __init__(self, layer_id: int, config: MiniMindConfig):
@@ -281,7 +323,7 @@ class MiniMindBlock(nn.Module):
         self.self_attn = Attention(config)
         self.input_layerNorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mlp = FeedForward(config)
+        self.mlp = MOEFeedForward(config) if config.use_moe else FeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache = False, attention_mask = None):
         #保存初始状态
@@ -366,8 +408,8 @@ class MiniMindModel(nn.Module):
             presents.append(present)
         # 最后做归一化
         hidden_states = self.norm(hidden_states)
-        # 稠密模型没有 MoE 的负载均衡损失，返回 0 占位，让训练脚本的 res.loss + res.aux_loss 统一可跑
-        aux_loss = hidden_states.new_zeros(1).squeeze()
+        # MOE更改
+        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):

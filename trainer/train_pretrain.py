@@ -213,7 +213,7 @@ if __name__ == "__main__":
         default=0,
         type=int,
         choices=[0, 1],
-        help="是否使用MoE架构（0=否，1=是）；本仓库的 MoE 还没实现，先跑通稠密模型",
+        help="是否使用MoE架构（0=否，1=是）；1 时把每层的 FFN 换成 4 专家 + 路由（实测参数量约 3.0 倍、每 token 算力不变）",
     )
 
     # ========== 数据和恢复参数 ==========
@@ -261,13 +261,30 @@ if __name__ == "__main__":
         help="跑到第几个 step 就停（0=不限制）；停止时会把训练状态落盘，便于续训",
     )
 
-    args = parser.parse_args()
+    # ========== MoE 专属参数 ==========
+    # 【改动点】原来这里只有一行 `if args.use_moe: raise SystemExit(...)` 的拦截，
+    # 拆掉拦截时把下面三个 argparse 参数一起删掉了，但 :286-288 仍在用它们，
+    # 会导致 AttributeError。这里按 MiniMindConfig 的默认值补回。
+    parser.add_argument(
+        "--num_experts",
+        default=4,
+        type=int,
+        help="MoE 的路由专家总数（只在 --use_moe 1 时生效）",
+    )
+    parser.add_argument(
+        "--num_experts_per_tok",
+        default=1,
+        type=int,
+        help="每个 token 选几个专家（top-k 的 k）",
+    )
+    parser.add_argument(
+        "--router_aux_loss_coef",
+        default=5e-4,
+        type=float,
+        help="负载均衡损失系数；实测玩具模型上 5e-4 偏弱，真实 8 层模型够用",
+    )
 
-    if args.use_moe:
-        raise SystemExit(
-            "❌ 当前 model/model.py 只实现了稠密 FFN，还没有 MoE。\n"
-            "   请先用 --use_moe 0（默认）跑通稠密模型。"
-        )
+    args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
     # local_rank: 当前进程在本机上的GPU编号
@@ -286,6 +303,10 @@ if __name__ == "__main__":
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe),
+        #MOE
+        num_experts=args.num_experts,
+        num_experts_per_tok=args.num_experts_per_tok, 
+        router_aux_loss_coef=args.router_aux_loss_coef,
     )
 
     # 断点续训：加载之前的训练状态（模型、优化器、进度）

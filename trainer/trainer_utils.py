@@ -146,6 +146,22 @@ def init_model(
         moe_suffix = "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
         weight_path = f"{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
+        # 【改动点】接「稠密权重 → MoE」时，带 _moe 后缀的文件并不存在
+        #（稠密权重叫 pretrain_v3_512.pth，MoE 才叫 ..._512_moe.pth）。
+        # 而 load_state_dict(strict=False) 本来就能做部分加载：
+        # 只有 attention / embedding / norm 这些同名同形状的参数会被继承，
+        # 稠密 FFN 被丢弃、MoE 的 gate+experts 保持随机初始化 —— 这正是官方做法。
+        # 所以这里加一次回退：带后缀的找不到，就试不带后缀的。
+        if not os.path.exists(weight_path) and moe_suffix:
+            fallback = f"{save_dir}/{from_weight}_{lm_config.hidden_size}.pth"
+            if os.path.exists(fallback):
+                Logger(
+                    f"⚠️ 未找到 MoE 权重 {os.path.basename(weight_path)}，"
+                    f"回退到稠密权重 {os.path.basename(fallback)} 做【部分加载】："
+                    f"attention/embedding/norm 继承，MoE 专家随机初始化"
+                )
+                weight_path = fallback
+
         if not os.path.exists(weight_path):
             raise FileNotFoundError(
                 f"权重文件不存在：{weight_path}\n"
@@ -154,7 +170,12 @@ def init_model(
             )
 
         weights = torch.load(weight_path, map_location=device)
-        model.load_state_dict(weights, strict=False)
+        missing, unexpected = model.load_state_dict(weights, strict=False)
+        if missing or unexpected:
+            Logger(
+                f"📥 部分加载：继承 {len(weights) - len(unexpected)} 个张量，"
+                f"缺失（随机初始化）{len(missing)} 个，丢弃（源多出）{len(unexpected)} 个"
+            )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     Logger(f"所加载Model可训练参数：{total_params / 1e6:.3f} 百万")
