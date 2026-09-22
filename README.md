@@ -51,6 +51,16 @@ python trainer/train_pretrain.py
 数据放在 `dataset/pretrain_hq.jsonl`，每行一个 `{"text": "..."}`。
 续训加 `--from_resume 1`，基于已有权重继续训练加 `--from_weight pretrain`。
 
+
+## 查看训练结果
+
+在项目根目录执行：
+
+```bash
+$env:PYTHONIOENCODING="utf-8"
+.\.venv\Scripts\python.exe -u eval.py --weight pretrain_v3 --preset knowledge --max_new_tokens 40
+```
+
 ## 许可证
 
 本项目使用 [MIT License](LICENSE)。
