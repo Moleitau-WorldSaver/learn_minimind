@@ -59,3 +59,10 @@ dataset/packed/
 /lessons/
 /reference/
 /learning-records/
+
+# 上游 MiniMind 源码快照（教学用事实基准：reference/*.html 会引用它）
+# 是别人仓库的代码副本，不代表本项目，不进仓库
+/minimind_sources/
+
+# 诊断 / 验证用的临时脚本目录
+/.tmpprobe/
