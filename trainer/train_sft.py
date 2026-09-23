@@ -2,7 +2,6 @@ import os
 import sys
 
 __package__ = "trainer"
-# 让这个文件能 import 到它父目录里的模块
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import datasets  # noqa: F401  # Windows pyarrow/torch DLL conflict workaround (issue #771)
@@ -16,13 +15,12 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.model import MiniMindConfig
-from dataset.lm_dataset import PretrainDataset
+from dataset.lm_dataset import SFTDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
-# 让 warnings 把所有警告都不再打印出来（全局静音）,给训练日志去噪
 warnings.filterwarnings('ignore')
 
-#训练一个epoch,一轮数据集是一个epoch
+
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
@@ -66,57 +64,49 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
+                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
             model.train()
             del state_dict
 
         del input_ids, labels, res, loss
 
+
 if __name__ == "__main__":
-    # 创建一个命令行参数解析器对象 
-    parser = argparse.ArgumentParser(description="MiniMind Pretraining")
-    #声明有n多个命令, 具体实现不在此处
+    parser = argparse.ArgumentParser(description="MiniMind Full SFT")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
-    parser.add_argument('--save_weight', default='pretrain', type=str, help="保存权重的前缀名")
+    parser.add_argument('--save_weight', default='full_sft', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=5e-4, help="初始学习率")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="初始学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
-    parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
     parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
-    parser.add_argument('--max_seq_len', default=340, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
+    parser.add_argument('--max_seq_len', default=768, type=int, help="训练的最大截断长度（中文1token≈1.5~1.7字符）")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--seed', default=42, type=int, help="随机种子（DDP下每个rank为seed+rank，每轮为seed+epoch）")
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_t2t_mini.jsonl", help="预训练数据路径")
-    parser.add_argument('--from_weight', default='none', type=str, help="基于哪个权重训练，为none则从头开始")
+    parser.add_argument("--data_path", type=str, default="../dataset/sft_t2t_mini.jsonl", help="训练数据路径")
+    parser.add_argument('--from_weight', default='pretrain', type=str, help="基于哪个权重训练，为none则不基于任何权重训练")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="wandb项目名")
+    parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT", help="wandb项目名")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1], help="是否使用torch.compile加速（0=否，1=是）")
-    # 读命令行参数，把值装进 Namespace 对象；用 args.属性名 取值（如 args.save_dir）
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
-    # DDP 模式下：建通信组 + 把本进程绑到对应卡；并返回本进程该用的 GPU 序号
     local_rank = init_distributed_mode()
-    #如果初始化了(也就是如果是DDP多卡设备), 就把args.device开始默认的0, 改成对应的local_rank
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
-    # 每个进程用 args.seed+rank 作种子：8 卡各自不同（随机行为不重样），
-    # 但种子完全由 args.seed 推导 → 同一条命令可复现    
     setup_seed(args.seed + (dist.get_rank() if dist.is_initialized() else 0))
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
-    #递归创建 args.save_dir 指向的那一串目录；如果目录已经存在，exist_ok=True 让它安静通过而不报错。
     os.makedirs(args.save_dir, exist_ok=True)
-    # 读取模型参数, 只描述结构
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    # 是否续训(如果续训, 去读检查点, 装进ckp_data)
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -130,12 +120,12 @@ if __name__ == "__main__":
         import swanlab as wandb # type: ignore
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)

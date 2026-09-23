@@ -35,11 +35,19 @@ def get_lr(current_step, total_steps, lr):
 
 # 初始化分布式
 def init_distributed_mode():
+    #从环境变量取一个"RANK" 的值；如果这个变量没设, 就返回 -1
+    #这里的RNAK只是用来当标志位的
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
-
+    #如果设置了 RANK, 进行下面操作
+    #初始化 PyTorch 分布式通信（默认进程组），让多个进程能互相同步数据；backend="nccl" 指定用 NVIDIA GPU 专用的通信后端。
     dist.init_process_group(backend="nccl")
+    # 从环境变量里取出本机进程的 GPU 序号（字符串），转成整数存进 local_rank
+    #注意: LOCAL_RANK 和 上面的 RANK 不是一个环境变量(单机上两者相同)
+    # LOCAL_RANK 是本机第几块卡
+    # RANK是进程在进程组里的序号
     local_rank = int(os.environ["LOCAL_RANK"])
+    #训练开始, torch会创建子进程, 每个子进程的LOCAL_RANK不一样, 开始绑卡
     torch.cuda.set_device(local_rank)
     return local_rank
 
@@ -47,14 +55,26 @@ def init_distributed_mode():
 # 设置种子
 def setup_seed(seed: int):
     random.seed(seed)
+    # np种子, 返回数组
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
+    #设备种子(其实真正有效的是第一行)
+    torch.manual_seed(seed) #CPU + 所有 GPU + MPS + XPU
+    torch.cuda.manual_seed(seed) #只有当前那一块 GPU
+    torch.cuda.manual_seed_all(seed) #所有 GPU
 
+    torch.backends.cudnn.deterministic = True #只用确定性算法 (开启), 默认是False
+    torch.backends.cudnn.benchmark = False #自动挑选最快算法 (关闭), 默认就是False
+    # 算法选定 + 算法内部确定,确保可复现(同一份输入 -> 同一份输出)
+    # 开始确定算法是为了规避浮点先后相加不一致的问题
+    # 戏剧性的例子:
+    # a, b, c = 1e16, -1e16, 1.0
+    # (a + b) + c  =  1.0      # 先抵消成 0，再 +1 → 1.0
+    # a + (b + c)  =  0.0      # 先算 b+c，1.0 被 -1e16 吃掉 → 再抵消，剩 0
+    # 确定性算法开启 要堵的是所有「并行顺序影响累加顺序」的路径
+    #总结: 确定性换的是「可复现」，不是精度，代价是几个百分点的速度;
+    # benchmark 换的是「速度」，代价是启动开销和可复现性
+    
 # 设置检查点
 def lm_checkpoint(
     lm_config,
