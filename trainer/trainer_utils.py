@@ -89,59 +89,102 @@ def lm_checkpoint(
 ):
     os.makedirs(save_dir, exist_ok=True)
 
+    # 如果有且开启了moe, 检查点文件名要加上moe后缀,造一个,如果没开启就空字符串
     moe_suffix = "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
-    ckp_path = f"{save_dir}/{weight}_{lm_config.hidden_size}{moe_suffix}.pth"
-    resume_path = f"{save_dir}/{weight}_{lm_config.hidden_size}{moe_suffix}_resume.pth"
+    #拼成完整的检查点名字
+    ckp_path = f"{save_dir}/{weight}_{lm_config.hidden_size}{moe_suffix}.pth" # 纯权重文件
+    # 权重(fp32) + 训练状态；体积≈5.6倍，两块来源:
+    #   ① fp32 权重 127MB  (fp16 的 2 倍, 续训必须全精度)
+    #   ② AdamW 动量 229MB (exp_avg + exp_avg_sq, 每个和模型一样大) ← 最大头
+    resume_path = f"{save_dir}/{weight}_{lm_config.hidden_size}{moe_suffix}_resume.pth" 
 
+    #todo ========== AdamW 优化器 ==============
+    # 干什么: 拿到梯度后决定"怎么更新参数"。每一步的实际步长 = lr × 自适应系数
+    #   lr 是局一个值(你给的), 后面用 optimizer.param_groups['lr'] 手动调度
+    #   自适应系数  每个参数独立, 由历史梯度算出:
+    #    所以, 实际步长 = lr × 系数, 系数量级为 1 → 步长由 lr 定标, 不随梯度大小漂移
+    #    → 第 1 步严格 = 1; 之后随梯度方向变乱而变小(方向不明就自动走小步)
+    #
+    # 名字里的 W = 解耦的权重衰减 (decoupled weight decay):
+    #   老 Adam 把 weight_decay 混进梯度里 → 会被 1/√v 一起缩放, 衰减力度被扭曲
+    #   (梯度大的参数衰减变弱、梯度小的变强 —— 不是你要的)
+    #   AdamW 把它拆出来直接作用在参数上 → 力度恒定, 泛化更好, 成为 Transformer 标配
+    #
+    # 代价: 每个参数要养 exp_avg + exp_avg_sq 两个动量张量, 各自和参数一样大
+    #       → 这就是 _resume.pth 比 .pth 大 5 倍多的主因
+    #
+    # 两级结构对应 optimizer.state_dict() 的两半:
+    #   param_groups → 全局(lr/betas/eps/weight_decay)   你给的
+    #   state        → 个体(step/exp_avg/exp_avg_sq)     算法攒的
+    #todo ========== AdamW 优化器 ===================
+
+
+    # 判断 model 是不是被 DDP 包过——是的话要先扒掉那层壳取里面的真模型，
+    # 因为 DDP 的 state_dict() 会给所有参数名加上 module. 前缀。
     if model is not None:
         if isinstance(model, DistributedDataParallel):
             state_dict = model.module.state_dict()
         else:
             state_dict = model.state_dict()
 
+        #先把权重写入临时文件, 写完正式改名, 保障写入时崩溃仍旧保存是完整的旧权重,而不是半个
         ckp_tmp = ckp_path + ".tmp"
         torch.save({k: v.half() for k, v in state_dict.items()}, ckp_tmp)
         os.replace(ckp_tmp, ckp_path)
 
+        # 如果上传日志到wandb(这里用的swanlab)
         wandb_id = None
         if wandb:
-            if hasattr(wandb, "get_run"):
-                run = wandb.get_run()
+            if hasattr(wandb, "get_run"): # 这个库有没有get_run接口
+                run = wandb.get_run() #得到当前实验的句柄
+                # 根据句柄取出id, 如果没找到默认None
                 wandb_id = getattr(run, "id", None) if run else None
-            else:
+            else: #如果没有get_run接口, 直接拿id
                 wandb_id = getattr(wandb, "id", None)
-
+        # 断言 optimizer 不是 None
+        # optimizer 是一个 AdamW 对象——你把自己模型的全部参数交给它，之后由它负责「拿着梯度把参数更新掉」
         assert optimizer is not None
+        # 用字典打包好恢复训练所需的一切
         resume_data = {
-            "model": state_dict,
-            "optimizer": optimizer.state_dict(),
-            "epoch": epoch,
-            "step": step,
+            "model": state_dict, #模型的参数字典
+            "optimizer": optimizer.state_dict(), #优化器攒下的全部记忆
+            "epoch": epoch, # 训练到第几轮 → 恢复后作为 range 的新起点
+            "step": step, # 【本轮内】已走完多少步 → 恢复后跳过前 N 个 batch
             "world_size": dist.get_world_size() if dist.is_initialized() else 1,
-            "wandb_id": wandb_id,
+                            # 当时用了几张卡 → 换卡数续训时按比例换算 step
+            "wandb_id": wandb_id, # 实验记录的身份证 → 续训时接回同一条日志曲线
         }
 
+        #kwargs 装的是「调用时传了、但函数签名里没有显式列出的」那些关键字参数——在你项目里，实际只有 scaler 一个
+        # scaler 是 torch.cuda.amp.GradScaler 的实例——混合精度训练用的「梯度缩放器」,用它做loss的放大以防止fp16梯度下溢
+        # 用key, value 来遍历 kwargs.items() 是「字典 kwargs 的 items」，GradScaler 是装在里面的那个值
         for key, value in kwargs.items():
             if value is not None:
                 if hasattr(value, "state_dict"):
-                    if isinstance(value, DistributedDataParallel):
+                    if isinstance(value, DistributedDataParallel):# 有 state_dict + 是 DDP, 扒壳后的状态字典
                         resume_data[key] = value.module.state_dict()
                     else:
-                        resume_data[key] = value.state_dict()
+                        resume_data[key] = value.state_dict() # 有 state_dict + 不是 DDP, 状态字典
                 else:
-                    resume_data[key] = value
+                    resume_data[key] = value #没有 state_dict, 原样写入
 
+        #同样的续训也是先传入临时，再改名
         resume_tmp = resume_path + ".tmp"
         torch.save(resume_data, resume_tmp)
         os.replace(resume_tmp, resume_path)
 
-    else:  # 加载模式
+    else:  # 加载模式(model 其实是控制开关, 开就是存档, 关就是读档)
+        #先检查存不存在
         if os.path.exists(resume_path):
+            #把 _resume.pth 从磁盘反序列化读回来（得到一个 dict），并强制把所有张量先放到 CPU 内存
+            # 如果CPU不够? 直接崩了
             ckp_data = torch.load(resume_path, map_location="cpu")
+            #world_size 存的是「保存这个 checkpoint 那一刻，一共有几个训练进程（几张卡）」, 默认是1
             saved_ws = ckp_data.get("world_size", 1)
+            #读出「现在这次运行有几个训练进程（几张卡）」；如果进程组没建（单卡跑），就当作 1
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
 
-            if saved_ws != current_ws:
+            if saved_ws != current_ws: #如果不相等,按照current_ws开始跑, 并打日志
                 ckp_data["step"] = ckp_data["step"] * saved_ws // current_ws
                 Logger(
                     f"GPU数量变化({saved_ws}→{current_ws})，step已自动转换为{ckp_data['step']}"
