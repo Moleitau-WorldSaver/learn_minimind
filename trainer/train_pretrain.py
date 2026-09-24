@@ -24,23 +24,30 @@ warnings.filterwarnings('ignore')
 
 #训练一个epoch,一轮数据集是一个epoch
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    # 记录时间
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
-        for param_group in optimizer.param_groups:
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate) # 算新的学习率
+        for param_group in optimizer.param_groups: # 手动更新
             param_group['lr'] = lr
 
-        with autocast_ctx:
+        # 把这个块里的重算子（matmul / conv / linear）自动转成低精度来算，出块时自动恢复
+        with autocast_ctx: 
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
+        # 它的精度由前向图的 dtype 自动决定，autocast 这个开关对它无效——而 scaler.scale 是反向侧的防下溢缩放，
+        # 跟前向精度选择是两个正交机制，放不放进 with 块都不会改变任何精度。
+        # 所以这行的位置理由是语义边界（"前向到此为止"）+ 对未来代码的防御
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0 or step == iters:
+            #回退原本的梯度大小
             scaler.unscale_(optimizer)
+            # 裁剪上限, 防止步长过大情况出现
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(optimizer)
@@ -116,13 +123,24 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
     # 读取模型参数, 只描述结构
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    # 是否续训(如果续训, 去读检查点, 装进ckp_data)
+    # 是否续训(如果续训, 去读检查点, 装进ckp_data , model掌握存读)
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
+    #优先选cuda 和 bfloat16()
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+    #   造一个"精度开关"(上下文管理器对象), 供训练循环里 `with autocast_ctx:` 使用
+    #   两个分支类型不同(contextlib.nullcontext vs torch.amp.autocast_mode.autocast),
+    #   但都实现了 __enter__/__exit__, 所以都能用在 with 里 —— 鸭子类型, 不要求同一个类
+    #     CPU -> nullcontext()        : 空壳, 什么都不做(算子在 fp32 下跑)
+    #     GPU -> torch.amp.autocast() : 块内的重算子(matmul/conv/linear)自动转 dtype
+    #   为什么要分支: 让循环里不写 if/else —— 一套 `with` 两种设备都能跑
+
+    # autocast_ctx 里存的是一个"精度开关"对象：平时 5 个字段（目标 dtype、设备、是否启用、是否缓存、后端名），
+    # 进 with 时临时追加 3 个旧值备份（prev / prev_fastdtype / prev_cache_enabled）供 __exit__ 恢复；
+    # CPU 分支的 nullcontext 则只有一个 enter_result 字段——空壳。
+    autocast_ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
     
     # ========== 4. 配wandb ==========
     wandb = None
@@ -131,18 +149,26 @@ if __name__ == "__main__":
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        #init() 才建立与服务器的连接、创建或接上实验记录
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、数据、优化器 ==========
+    # 用参数造出六个训练组件:
+    # 大语言模型本体, 分词器, 预训练数据集对象, 分布式采样器, 梯度缩放器, 优化器
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    # 在训练组件这里, 虽然已经开始处理数据, 但其实数据并没有处理好, 只有在取样本那一刻才真正处理好
+    # 这一步代码只跑了PretrainDatase.__init__()
+    # 返回的train_ds 是PretrainDataset 对象 → input_ids, labels, attention_mask
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    scaler = torch.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
+    # 如果确认续训
     start_epoch, start_step = 0, 0
     if ckp_data:
+        #读取数据
         model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])
@@ -150,6 +176,7 @@ if __name__ == "__main__":
         start_step = ckp_data.get('step', 0)
     
     # ========== 7. 编译和分布式包装 ==========
+    # 如果选择了使用torch.compile加速
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')

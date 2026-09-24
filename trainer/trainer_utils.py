@@ -184,7 +184,7 @@ def lm_checkpoint(
             #读出「现在这次运行有几个训练进程（几张卡）」；如果进程组没建（单卡跑），就当作 1
             current_ws = dist.get_world_size() if dist.is_initialized() else 1
 
-            if saved_ws != current_ws: #如果不相等,按照current_ws开始跑, 并打日志
+            if saved_ws != current_ws: #如果不相等,卡数变了 → 把存档的 step 折算到新卡数下(保持进度比例), 再打日志
                 ckp_data["step"] = ckp_data["step"] * saved_ws // current_ws
                 Logger(
                     f"GPU数量变化({saved_ws}→{current_ws})，step已自动转换为{ckp_data['step']}"
