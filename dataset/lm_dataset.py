@@ -1,27 +1,20 @@
 from torch.utils.data import Dataset
 import torch
+import json
 import os
 import random
-from datasets import load_dataset
+from datasets import load_dataset, Features, Sequence, Value
 
 # 禁用 HuggingFace tokenizer 的多进程并行，避免在 DataLoader 多进程环境中产生死锁
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 全局预处理 / 后处理工具函数
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 def pre_processing_chat(conversations, add_system_ratio=0.2):
-    """
-    对话前处理：以一定概率随机插入 system 消息。
+    # 工具对话: 不注入人设 system 提示。
+    # 理由: SYSTEM_PROMPTS 全是人设措辞, 而工具对话的 system 槽位承载的是
+    #       工具 schema(模板渲染成 <tools>...</tools>)。往里插人设会污染 schema,
+    #       并给模型发出矛盾信号(泛泛的人格描述 vs 严格的调用格式命令)。
+    if any(conv.get('tools') for conv in conversations): return conversations
 
-    特点：
-    - 只有当首条消息不是 system 角色时才可能插入。
-    - add_system_ratio 控制插入概率（默认 20%），引入随机性可提升模型
-      对有/无 system prompt 两种情况的泛化能力。
-    - system 内容从预定义的中英文 prompt 池中随机抽取，覆盖不同表达风格。
-    """
     SYSTEM_PROMPTS = [
         "你是一个知识丰富的AI，尽力为用户提供准确的信息。",
         "你是minimind，一个小巧但有用的语言模型。",
@@ -32,46 +25,24 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
         "You are minimind, a lightweight intelligent assistant.",
         "You are a friendly chatbot. Please answer the user's questions carefully.",
         "You are a knowledgeable AI. Try your best to provide accurate information.",
-        "You are minimind, a small but useful language model.",
+        "You are minimind, a small but useful language model."
     ]
-    if conversations[0].get("role") != 'system':
+    # 20%概率性添加system(真实概率可能为18%左右)
+    if conversations[0].get('role') != 'system':
         if random.random() < add_system_ratio:
-            return [
-                {"role": "system", "content": random.choice(SYSTEM_PROMPTS)}
-            ] + conversations
+            return [{'role': 'system', 'content': random.choice(SYSTEM_PROMPTS)}] + conversations
     return conversations
 
-
-def post_processing_chat(prompt_content, empty_think_ratio=0.05):
-    """
-    对话后处理：清理模板渲染后多余的空 <think> 块。
-
-    特点：
-    - 针对带 CoT（chain-of-thought）格式的模型，apply_chat_template 有时会
-      渲染出 "<think>\n\n</think>\n\n" 这样的空思考块占位符。
-    - 大部分情况下（概率 1 - empty_think_ratio = 95%）直接删除该空块，
-      防止模型学到"无意义思考"的坏习惯。
-    - 保留少量空思考块（empty_think_ratio = 5%），让模型也能处理该边界情况。
-    """
-    if (
-        "<think>\n\n</think>\n\n" in prompt_content
-        and random.random() > empty_think_ratio
-    ):
-        prompt_content = prompt_content.replace("<think>\n\n</think>\n\n", "")
+def post_processing_chat(prompt_content, empty_think_ratio=0.2, remove_empty_think=None):
+    # 以80%概率移除空思考标签(如果用户表态,就一定删除)
+    if '<think>\n\n</think>\n\n' in prompt_content:
+        if remove_empty_think is None:
+            remove_empty_think = random.random() > empty_think_ratio
+        if remove_empty_think:
+            # 移除空思考
+            prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
     return prompt_content
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. PretrainDataset —— 自回归预训练数据集
-# ──────────────────────────────────────────────────────────────────────────────
-# 训练目标：Next-Token Prediction（下一个 token 预测）
-# 数据格式：{"text": "一段原始文本"}
-# 训练特点：
-#   - 模型对整段文本的每个位置都进行预测，没有"只学回复"的区分。
-#   - 使用 BOS/EOS 标记文本边界，让模型学会文本的起止。
-#   - PAD token 对应的 label 置 -100，不参与 loss 计算，节省无效梯度。
-#   - labels 直接 clone 自 input_ids（即 X 和 Y 错位一格：Y[t] = X[t+1]）。
-# ──────────────────────────────────────────────────────────────────────────────
 class PretrainDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
@@ -116,3 +87,14 @@ class PretrainDataset(Dataset):
         #所有PAD的位置变成-100
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
+
+
+class SFTDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        features = Features({'conversations': [{'role': Value('string'), 'content': Value('string'), 'reasoning_content': Value('string'), 'tools': Value('string'), 'tool_calls': Value('string')}]})
+        self.samples = load_dataset('json', data_files=jsonl_path, split='train', features=features)
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids

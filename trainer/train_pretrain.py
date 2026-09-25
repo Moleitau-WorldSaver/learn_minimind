@@ -50,11 +50,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # 裁剪上限, 防止步长过大情况出现
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
+            #配合优化器更新参数
             scaler.step(optimizer)
-            scaler.update()
+            scaler.update() # 更新下一次倍数
 
             optimizer.zero_grad(set_to_none=True)
 
+        # 日志统计
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -64,7 +66,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
-
+        # 定期存档, 方便续训
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
