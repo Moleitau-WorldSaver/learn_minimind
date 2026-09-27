@@ -1,69 +1,100 @@
-import os, time, argparse, warnings
+import time
+import argparse
+import random
+import warnings
 import torch
-from transformers import AutoTokenizer, TextStreamer
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model import MiniMindConfig, MiniMindForCausalLM
-from trainer.trainer_utils import setup_seed
-
+from model.model_lora import *
+from trainer.trainer_utils import setup_seed, get_model_params
 warnings.filterwarnings('ignore')
 
-# 预训练权重只会"续写"，所以给的是开头片段，不是"问题"
-PRESETS = {
-    'news':      ['人工智能是', '根据最新研究报告显示', '记者昨日从有关部门获悉', '今天天气', '中国的首都'],
-}
+# 初始化模型
+def init_model(args):
+    tokenizer = AutoTokenizer.from_pretrained(args.load_from)
+    if 'model' in args.load_from:
+        model = MiniMindForCausalLM(MiniMindConfig(
+            hidden_size=args.hidden_size,
+            num_hidden_layers=args.num_hidden_layers,
+            use_moe=bool(args.use_moe),
+            inference_rope_scaling=args.inference_rope_scaling
+        ))
+        moe_suffix = '_moe' if args.use_moe else ''
+        ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
+        model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
+        # 加载微调
+        # if args.lora_weight != 'None':
+        #     apply_lora(model)
+        #     load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
+    get_model_params(model, model.config)
+    return model.half().eval().to(args.device), tokenizer
 
-
-@torch.no_grad()
 def main():
-    parser = argparse.ArgumentParser(description='MiniMind 预训练权重续写')
-    parser.add_argument('--load_from', default='model', type=str, help='分词器目录')
-    parser.add_argument('--save_dir', default='out', type=str, help='权重目录')
-    parser.add_argument('--weight', default='pretrain', type=str, help='权重前缀（不含 _512 后缀）')
-    parser.add_argument('--hidden_size', default=512, type=int)
-    parser.add_argument('--num_hidden_layers', default=8, type=int)
-    # 【改动点】加 --use_moe：MoE 存档名带 _moe 后缀（pretrain_moe_512_moe.pth），
-    # 且模型必须以 use_moe=True 构造，否则 strict=True 加载会 size mismatch。
-    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1],
-                        help='1=加载 MoE 权重（存档名带 _moe 后缀）')
-    parser.add_argument('--max_new_tokens', default=80, type=int)
-    parser.add_argument('--temperature', default=0.9, type=float)
-    parser.add_argument('--top_p', default=0.9, type=float)
-    parser.add_argument('--preset', default='news', choices=list(PRESETS))
-    parser.add_argument('--prompt', default='', type=str, help='自定义提示词，非空则覆盖 preset')
-    parser.add_argument('--show_speed', default=1, type=int)
-    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str)
+    parser = argparse.ArgumentParser(description="MiniMind模型推理与对话")
+    parser.add_argument('--load_from', default='model', type=str, help="模型加载路径（model=原生torch权重，其他路径=transformers格式）")
+    parser.add_argument('--save_dir', default='out', type=str, help="模型权重目录")
+    parser.add_argument('--weight', default='full_sft', type=str, help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）")
+    parser.add_argument('--lora_weight', default='None', type=str, help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）")
+    parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
+    parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
+    parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--inference_rope_scaling', default=False, action='store_true', help="启用RoPE位置编码外推（4倍，仅解决位置编码问题）")
+    parser.add_argument('--max_new_tokens', default=8192, type=int, help="最大生成长度（注意：并非模型实际长文本能力）")
+    parser.add_argument('--temperature', default=0.85, type=float, help="生成温度，控制随机性（0-1，越大越随机）")
+    parser.add_argument('--top_p', default=0.95, type=float, help="nucleus采样阈值（0-1）")
+    parser.add_argument('--open_thinking', default=0, type=int, help="是否开启自适应思考（0=否，1=是）")
+    parser.add_argument('--historys', default=0, type=int, help="携带历史对话轮数（需为偶数，0表示不携带历史）")
+    parser.add_argument('--show_speed', default=1, type=int, help="显示decode速度（tokens/s）")
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str, help="运行设备")
     args = parser.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.load_from, local_files_only=True)
-    model = MiniMindForCausalLM(MiniMindConfig(
-        hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-        use_moe=bool(args.use_moe)))          # 【改动点】跟随 --use_moe 构造
-    # 【改动点】与 train_pretrain.py:159-160 用同一套后缀规则，否则拼不出 MoE 存档名
-    moe_suffix = '_moe' if args.use_moe else ''
-    ckp = os.path.join(args.save_dir, f'{args.weight}_{args.hidden_size}{moe_suffix}.pth')
-    model.load_state_dict(torch.load(ckp, map_location='cpu', weights_only=True), strict=True)
-    model = model.half().eval().to(args.device)      # 官方这行是对的，保留
-    print(f'已加载 {ckp} | {sum(p.numel() for p in model.parameters()) / 1e6:.3f} M\n')
-
+    # 提示词列表
+    prompts = [
+        '你有什么特长？',
+        '为什么天空是蓝色的',
+        '请用Python写一个计算斐波那契数列的函数',
+        '解释一下"光合作用"的基本过程',
+        '如果明天下雨，我应该如何出门',
+        '比较一下猫和狗作为宠物的优缺点',
+        '解释什么是机器学习',
+        '推荐一些中国的美食'
+    ]
+    
+    conversation = []
+    model, tokenizer = init_model(args)
+    input_mode = int(input('[0] 自动测试\n[1] 手动输入\n'))
     streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
-    for prompt in ([args.prompt] if args.prompt else PRESETS[args.preset]):
-        print(f'\n片段: {prompt}')
-        setup_seed(2026)
-        # 预训练模型只认"纯文本前缀"，不走 chat template
-        print('续写: ', end='')
+    
+    prompt_iter = prompts if input_mode == 0 else iter(lambda: input('💬: '), '')
+    for prompt in prompt_iter:
+        setup_seed(random.randint(0, 31415926))
+        if input_mode == 0: print(f'💬: {prompt}')
+        conversation = conversation[-args.historys:] if args.historys else []
+        conversation.append({"role": "user", "content": prompt})
+        if 'pretrain' in args.weight:
+            inputs = tokenizer.bos_token + prompt
+        else:
+            inputs = tokenizer.apply_chat_template(conversation, tokenize=False, add_generation_prompt=True, open_thinking=bool(args.open_thinking))
+        
+        inputs = tokenizer(inputs, return_tensors="pt", truncation=True).to(args.device)
+
+        print('🧠: ', end='')
         st = time.time()
-        inputs = tokenizer(tokenizer.bos_token + prompt, return_tensors='pt').to(args.device)
+        # 生成ID
         generated_ids = model.generate(
-            inputs=inputs['input_ids'], attention_mask=inputs['attention_mask'],
+            inputs=inputs["input_ids"], attention_mask=inputs["attention_mask"],
             max_new_tokens=args.max_new_tokens, do_sample=True, streamer=streamer,
             pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
-            top_p=args.top_p, temperature=args.temperature, repetition_penalty=1,
+            top_p=args.top_p, temperature=args.temperature, repetition_penalty=1
         )
-        n = len(generated_ids[0]) - len(inputs['input_ids'][0])
-        if args.show_speed:
-            print(f'\n[Speed]: {n / (time.time() - st):.2f} tokens/s')
+        response = tokenizer.decode(generated_ids[0][len(inputs["input_ids"][0]):], skip_special_tokens=True)
+        conversation.append({"role": "assistant", "content": response})
+        gen_tokens = len(generated_ids[0]) - len(inputs["input_ids"][0])
+        print(f'\n[Speed]: {gen_tokens / (time.time() - st):.2f} tokens/s\n\n') if args.show_speed else print('\n\n')
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         main()
     except (EOFError, KeyboardInterrupt):

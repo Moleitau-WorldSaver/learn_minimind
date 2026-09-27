@@ -15,6 +15,18 @@ from transformers import AutoTokenizer
 from model.model import MiniMindForCausalLM
 
 
+def get_model_params(model, config):
+    total = sum(p.numel() for p in model.parameters()) / 1e6
+    n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
+    n_active = getattr(config, 'num_experts_per_tok', 0)
+    n_shared = getattr(config, 'n_shared_experts', 0)
+    expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.experts.0.' in n) / 1e6
+    shared_expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.shared_experts.0.' in n) / 1e6
+    base = total - (expert * n_routed) - (shared_expert * n_shared)
+    active = base + (expert * n_active) + (shared_expert * n_shared)
+    if active < total: Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
+    else: Logger(f'Model Params: {total:.2f}M')
+
 # 检查是否是主进程
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
