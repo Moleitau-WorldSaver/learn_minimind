@@ -23,9 +23,9 @@ def init_model(args):
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
         model.load_state_dict(torch.load(ckp, map_location=args.device), strict=True)
         # 加载微调
-        # if args.lora_weight != 'None':
-        #     apply_lora(model)
-        #     load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
+        if args.lora_weight != 'None':
+            apply_lora(model)
+            load_lora(model, f'./{args.save_dir}/{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth')
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     get_model_params(model, model.config)
@@ -52,14 +52,11 @@ def main():
 
     # 提示词列表
     prompts = [
-        '你有什么特长？',
-        '为什么天空是蓝色的',
-        '请用Python写一个计算斐波那契数列的函数',
-        '解释一下"光合作用"的基本过程',
-        '如果明天下雨，我应该如何出门',
-        '比较一下猫和狗作为宠物的优缺点',
-        '解释什么是机器学习',
-        '推荐一些中国的美食'
+        '高血压患者平时要注意什么？',
+        '糖尿病的早期症状有哪些？',
+        '感冒发烧了应该怎么处理？',
+        '我最近总是头晕，量了血压偏高，平时该注意什么？',
+        '我这几天一直咳嗽发烧，吃了药也不见好，会不会是肺炎？',
     ]
     
     conversation = []
